@@ -1,7 +1,6 @@
 const express = require("express");
 const axios = require("axios");
 const crypto = require("crypto");
-const fs = require("fs");
 const qs = require("qs");
 require("dotenv").config();
 
@@ -10,10 +9,9 @@ const port = process.env.PORT || 3000;
 
 const API_KEY = process.env.KRAKEN_API_KEY;
 const API_SECRET = process.env.KRAKEN_API_SECRET;
-const TELEGRAM_USER_ID = process.env.ALLOWED_TELEGRAM_ID;
-const DAILY_LIMIT = 500; // USD
+const ALLOWED_USER_ID = process.env.ALLOWED_TELEGRAM_ID;
+const DAILY_LIMIT = 500;
 const COOLDOWN_MS = 60 * 60 * 1000; // 1 hour
-
 let lastTradeTime = 0;
 
 function getKrakenSignature(path, requestData, secret, nonce) {
@@ -26,93 +24,45 @@ function getKrakenSignature(path, requestData, secret, nonce) {
   return hmac_digest;
 }
 
-function getTodayFileName() {
-  const date = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
-  return `./logs/spent-${date}.json`;
-}
-
-function getTodaySpent() {
-  const file = getTodayFileName();
-  if (fs.existsSync(file)) {
-    const data = JSON.parse(fs.readFileSync(file));
-    return data.total || 0;
-  }
-  return 0;
-}
-
-function logTodaySpend(amount) {
-  const file = getTodayFileName();
-  const total = getTodaySpent() + parseFloat(amount);
-  fs.writeFileSync(file, JSON.stringify({ total }));
-}
-
-async function getKrakenXRPBalance() {
-  const nonce = Date.now() * 1000;
-  const requestData = { nonce };
-  const path = "/0/private/Balance";
-  const signature = getKrakenSignature(path, requestData, API_SECRET, nonce);
-
-  const headers = {
-    "API-Key": API_KEY,
-    "API-Sign": signature,
-    "Content-Type": "application/x-www-form-urlencoded"
-  };
-
-  const response = await axios.post(
-    "https://api.kraken.com" + path,
-    qs.stringify(requestData),
-    { headers }
-  );
-
-  const result = response.data;
-  if (result.error && result.error.length) {
-    throw new Error(result.error.join(", "));
-  }
-
-  const balances = result.result;
-  return parseFloat(balances["XXRP"] || 0); // Kraken's XRP ticker is "XXRP"
-}
+// Track daily limit
+let today = new Date().toISOString().slice(0, 10);
+let spentToday = 0;
 
 app.get("/trade", async (req, res) => {
   const { coin = "XRP", amount = "100", type = "buy", user = "" } = req.query;
 
-  // 1. Telegram user validation
-  if (user !== TELEGRAM_USER_ID) {
+  // Validate user
+  if (user !== ALLOWED_USER_ID) {
     return res.status(403).send("❌ Unauthorized user.");
   }
 
-  // 2. Cooldown check
+  // Cooldown check
   const now = Date.now();
   if (now - lastTradeTime < COOLDOWN_MS) {
-    return res.status(429).send("⏳ Trade cooldown in effect. Try again later.");
+    return res.status(429).send("⏳ Cooldown in effect. Please wait before trading again.");
   }
 
-  // 3. Daily limit check (for buys)
-  if (type === "buy") {
-    const todaySpent = getTodaySpent();
-    if (todaySpent + parseFloat(amount) > DAILY_LIMIT) {
-      return res.status(403).send("💰 Daily spend limit exceeded.");
-    }
+  // Daily limit check
+  const todayNow = new Date().toISOString().slice(0, 10);
+  if (todayNow !== today) {
+    today = todayNow;
+    spentToday = 0;
+  }
+  if (spentToday + parseFloat(amount) > DAILY_LIMIT) {
+    return res.status(403).send("💰 Daily limit exceeded.");
   }
 
-  // 4. Balance check (for sells)
-  if (type === "sell") {
-    const xrpBalance = await getKrakenXRPBalance();
-    if (xrpBalance < parseFloat(amount)) {
-      return res.status(403).send(`❌ Not enough XRP to sell. Available: ${xrpBalance}`);
-    }
-  }
-
-  // Kraken market order
+  // Kraken Market Order
   const pair = `${coin}/USD`.toUpperCase();
   const nonce = Date.now() * 1000;
   const requestData = {
     nonce,
     pair,
-    type,
+    type: type.toLowerCase(),
     ordertype: "market",
-    volume: amount,
+    volume: amount
   };
+
   const path = "/0/private/AddOrder";
   const signature = getKrakenSignature(path, requestData, API_SECRET, nonce);
 
@@ -121,25 +71,24 @@ app.get("/trade", async (req, res) => {
       headers: {
         "API-Key": API_KEY,
         "API-Sign": signature,
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
+        "Content-Type": "application/x-www-form-urlencoded"
+      }
     });
 
     const result = response.data;
     if (result.error && result.error.length) {
-      throw new Error(result.error.join(", "));
+      return res.status(500).send("❌ Kraken error: " + result.error.join(", "));
     }
 
     lastTradeTime = now;
-    if (type === "buy") logTodaySpend(amount);
-
-    res.send("✅ Trade executed: " + JSON.stringify(result.result));
+    spentToday += parseFloat(amount);
+    return res.send("✅ Trade executed: " + JSON.stringify(result.result));
   } catch (err) {
-    console.error("❌ Trade error:", err.message);
-    res.status(500).send("Trade failed: " + err.message);
+    console.error(err.message);
+    return res.status(500).send("❌ Trade failed: " + err.message);
   }
 });
 
 app.listen(port, () => {
-  console.log(`✅ Kraken bot running with risk controls on port ${port}`);
+  console.log(`✅ Trade bot running on port ${port}`);
 });
